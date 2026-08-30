@@ -1,580 +1,595 @@
 """
-Connector script to link dictionary learning models with the visualization framework.
+Visualizer: create image-based visualizations of SAE feature analysis.
+Modified to show contextual tokens around peak activations with single-line display.
 """
-import sys
-import torch as t
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.colors import LinearSegmentedColormap
+import numpy as np
+from typing import Dict, List, Optional
 from pathlib import Path
-from typing import List, Optional, Union, Dict, Any, Tuple
+import seaborn as sns
+from real_activations import FeatureStats, ActivationExample
 
-# Add support for dictionary learning models
-sys.path.append(str(Path(__file__).parent.parent))
 
-from transformer_lens import HookedTransformer, ActivationCache
-from transformer_lens.utils import get_act_name
+# Color scheme constants
+REAL_COLOR = 'lightcoral'      # Red for real data
+SYNTHETIC_COLOR = 'lightblue'   # Blue for synthetic data
 
-from sae_vis.data_config_classes import (
-    ActsHistogramConfig, Column, FeatureTablesConfig, 
-    SaeVisConfig, SaeVisLayoutConfig, SeqMultiGroupConfig,
-    LogitsTableConfig, LogitsHistogramConfig
-)
-from sae_vis.data_storing_fns import SaeVisData
-import sae_vis.model_fns
 
-class AutoEncoderAdapter:
+def visualize_features(feature_stats: Dict[int, FeatureStats], output_dir: str = "visualizations",
+                      analysis_type: str = "analysis", max_features_per_plot: int = 6) -> List[str]:
     """
-    Adapter class to map your AutoEncoder to what sae_vis expects.
-    Handles differences in dimensions and structure between various SAE implementations.
-    """
-    
-    def __init__(self, sae, hook_name="blocks.0.mlp.hook_post", hook_layer=0):
-        self.sae = sae
-        
-        # Create a config object with necessary attributes
-        class Config:
-            def __init__(self):
-                self.hook_name = hook_name
-                self.hook_layer = hook_layer
-                self.d_in = sae.activation_dim
-                self.d_sae = sae.dict_size
-        
-        # Add the config to the adapter
-        self.cfg = Config()
-        
-        # Store the original activation dimensions
-        self.activation_dim = sae.activation_dim
-        self.dict_size = sae.dict_size
-        
-        # Map weight matrices
-        # The visualization expects decoder weights in shape [dict_size, d_model]
-        # and encoder weights in shape [d_model, dict_size]
-        self.W_dec = sae.decoder.weight  # [dict_size, activation_dim]
-        self.W_enc = sae.encoder.weight.T  # [activation_dim, dict_size]
-        
-        # Bias terms
-        self.b_dec = sae.bias if hasattr(sae, 'bias') else (
-            sae.decoder.bias if hasattr(sae.decoder, 'bias') else None
-        )
-        self.b_enc = sae.encoder.bias if hasattr(sae.encoder, 'bias') else None
-        
-        # Other potentially needed attributes
-        self.use_error_term = False
-    
-    def encode(self, x, **kwargs):
-        # Forward any additional kwargs that SAE-vis might pass
-        return self.sae.encode(x)
-    
-    def decode(self, f, **kwargs):
-        # Forward any additional kwargs that SAE-vis might pass
-        return self.sae.decode(f)
-    
-    def forward(self, x, output_features=False, **kwargs):
-        # Make sure this returns both decoded x and features if requested
-        if output_features:
-            x_hat, f = self.sae(x, output_features=True)
-            return x_hat, f
-        else:
-            return self.sae(x)
-            
-    def state_dict(self):
-        """Return the state dictionary of the wrapped SAE."""
-        return self.sae.state_dict()
-    
-    def load_state_dict(self, state_dict):
-        """Load a state dictionary into the wrapped SAE."""
-        return self.sae.load_state_dict(state_dict)
-    
-    def to(self, *args, **kwargs):
-        """Move the SAE to the specified device."""
-        return self.sae.to(*args, **kwargs)
-    
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-    
-    def __getattr__(self, name):
-        try:
-            return getattr(self.sae, name)
-        except AttributeError:
-            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
-
-
-class ModelAdapter:
-    """
-    Adapter class to make HookedTransformer compatible with sae_vis.
-    Provides the expected interface and handles hook name mapping.
-    """
-    
-    def __init__(self, model, hook_name=None):
-        self.model = model
-        self.W_U = model.W_U
-        self.b_U = model.b_U
-        self.cfg = model.cfg
-        self.tokenizer = model.tokenizer
-        self.hook_name = hook_name
-        
-        # Define mappings between common hook names
-        self.hook_mappings = {
-            "blocks.0.mlp.hook_post": ["blocks.0.hook_mlp_out", "blocks.0.mlp.hook_post"],
-            "blocks.0.mlp.hook_pre": ["blocks.0.mlp.hook_pre"],
-            "blocks.0.hook_mlp_out": ["blocks.0.hook_mlp_out", "blocks.0.mlp.hook_post"]
-        }
-    
-    def run_with_cache_with_saes(self, tokens, saes=None, stop_at_layer=None, names_filter=None, remove_batch_dim=False):
-        """
-        Run the model with cache and add SAE activations to the cache.
-        
-        This method emulates the behavior expected by sae_vis when running with SAEs.
-        """
-        # Ensure we're requesting all needed hooks
-        required_hooks = ['blocks.0.hook_resid_post']
-        
-        if saes:
-            for sae in saes:
-                hook_name = sae.cfg.hook_name
-                # Add original hook name and any alternative names
-                required_hooks.append(hook_name)
-                if hook_name in self.hook_mappings:
-                    required_hooks.extend(self.hook_mappings[hook_name])
-        
-        # Combine with any names_filter provided
-        if names_filter:
-            required_hooks.extend(names_filter)
-            
-        # Remove duplicates
-        required_hooks = list(set(required_hooks))
-            
-        # Run the model with cache
-        output, cache = self.model.run_with_cache(
-            tokens, 
-            stop_at_layer=stop_at_layer,
-            names_filter=required_hooks
-        )
-        
-        # Get the cache as a dictionary we can modify
-        cache_dict = dict(cache.cache_dict)
-        
-        # Print available hooks for debugging
-        print(f"Available hooks in cache: {sorted(list(cache_dict.keys()))}")
-        
-        # Process SAEs
-        if saes:
-            for sae in saes:
-                original_hook_name = sae.cfg.hook_name
-                
-                # Find the best available hook for this SAE
-                hook_name = self._find_best_hook(original_hook_name, cache_dict)
-                
-                if hook_name:
-                    # Get activations and compute SAE outputs
-                    activations = cache_dict[hook_name].to(sae.W_enc.device)
-                    acts_post = sae.encode(activations)
-                    
-                    # Add to cache
-                    cache_dict[f"{original_hook_name}.hook_sae_acts_post"] = acts_post
-                    cache_dict[f"{original_hook_name}.hook_sae_input"] = activations
-                    
-                    print(f"Added SAE activations using hook '{hook_name}' to cache")
-                else:
-                    # If no suitable hook is found, use residual post as fallback
-                    if 'blocks.0.hook_resid_post' in cache_dict:
-                        activations = cache_dict['blocks.0.hook_resid_post'].to(sae.W_enc.device)
-                        acts_post = sae.encode(activations)
-                        
-                        cache_dict[f"{original_hook_name}.hook_sae_acts_post"] = acts_post
-                        cache_dict[f"{original_hook_name}.hook_sae_input"] = activations
-                        
-                        print(f"Using residual post as fallback for '{original_hook_name}'")
-                    else:
-                        raise KeyError(f"No suitable hook found for '{original_hook_name}'")
-        
-        # Handle remove_batch_dim if needed
-        if remove_batch_dim:
-            assert tokens.shape[0] == 1, "Can only remove batch dim if batch size is 1"
-            output = output[0]
-            cache_dict = {k: v[0] if isinstance(v, t.Tensor) and v.dim() > 0 and v.shape[0] == 1 else v 
-                         for k, v in cache_dict.items()}
-        
-        # Create a new ActivationCache object
-        new_cache = ActivationCache(cache_dict, model=self.model)
-        
-        return output, new_cache
-    
-    def _find_best_hook(self, hook_name, cache_dict):
-        """Find the best available hook that matches the given hook name."""
-        # First check if the exact hook is available
-        if hook_name in cache_dict:
-            return hook_name
-        
-        # Then check the mappings
-        if hook_name in self.hook_mappings:
-            for alt_hook in self.hook_mappings[hook_name]:
-                if alt_hook in cache_dict:
-                    return alt_hook
-        
-        # Try to guess based on components of the name
-        if "mlp" in hook_name and "post" in hook_name:
-            possible_hooks = [k for k in cache_dict if "mlp" in k.lower() and 
-                             ("post" in k.lower() or "out" in k.lower())]
-            if possible_hooks:
-                return possible_hooks[0]
-        
-        return None
-    
-    def __getattr__(self, name):
-        """Forward attributes to the underlying model."""
-        return getattr(self.model, name)
-
-
-class SAEVisAdapter:
-    """Helper class to adapt dictionary learning models to the visualization framework."""
-    
-    @staticmethod
-    def create_default_layout(othello_mode=False, height=1000, simplified=False):
-        """
-        Create a visualization layout configuration.
-        
-        Args:
-            othello_mode: Whether to use the Othello-specific layout
-            height: Height of the visualization in pixels
-            simplified: Whether to use a simplified layout with fewer components
-        """
-        if simplified:
-            return SaeVisLayoutConfig(
-                columns=[
-                    Column(ActsHistogramConfig(), width=400),
-                ],
-                height=500,
-            )
-        elif othello_mode:
-            return SaeVisLayoutConfig.default_othello_layout()
-        else:
-            return SaeVisLayoutConfig(
-                columns=[
-                    Column(FeatureTablesConfig(n_rows=5), width=400),
-                    Column(
-                        ActsHistogramConfig(), 
-                        LogitsTableConfig(n_rows=10), 
-                        LogitsHistogramConfig(),
-                        width=500
-                    ),
-                    Column(
-                        SeqMultiGroupConfig(
-                            buffer=(5, 5), 
-                            n_quantiles=5, 
-                            top_acts_group_size=20
-                        ),
-                        width=1000
-                    ),
-                ],
-                height=height,
-            )
-    
-    @staticmethod
-    def patch_to_resid_dir():
-        """
-        Patch the to_resid_dir function to handle dimension mismatches.
-        Returns the original function for restoration.
-        """
-        original_to_resid_dir = sae_vis.model_fns.to_resid_dir
-        
-        def flexible_to_resid_dir(dir, sae, model, input=False):
-            """
-            A more flexible version of to_resid_dir that handles dimension mismatches.
-            """
-            # Handle case where dir and model dimensions don't match by returning identity
-            try:
-                # First, determine the hook type
-                if hasattr(sae, 'cfg') and hasattr(sae.cfg, 'hook_name'):
-                    hook_type = sae.cfg.hook_name.split(".hook_")[-1]
-                else:
-                    hook_type = "custom"
-                    
-                # For most common hook types, just return identity
-                if hook_type in ["resid_pre", "resid_mid", "resid_post", "attn_out", "mlp_out", "custom"]:
-                    return dir
-                
-                # For MLP pre/post hooks, check dimensions before multiplying
-                elif hook_type in ["pre", "post"]:
-                    # Check if dimensions are compatible
-                    if input:
-                        W_in = model.W_in[sae.cfg.hook_layer].T
-                        if dir.shape[-1] != W_in.shape[0]:
-                            print(f"Dimension input mismatch: {dir.shape[-1]} != {W_in.shape[0]}, using identity")
-                            return dir
-                        return dir @ W_in
-                    else:
-                        W_out = model.W_out[sae.cfg.hook_layer]
-                        if dir.shape[-1] != W_out.shape[0]:
-                            print(f"Dimension output mismatch: {dir.shape[-1]} != {W_out.shape[0]}, using identity")
-                            return dir
-                        return dir @ W_out
-                
-                # For attention hooks
-                elif hook_type == "z":
-                    if input:
-                        W_V = model.W_V[sae.cfg.hook_layer]
-                        V_flat = einops.rearrange(W_V, "n_heads d_model d_head -> (n_heads d_head) d_model")
-                        if dir.shape[-1] != V_flat.shape[0]:
-                            print(f"Dimension mismatch: {dir.shape[-1]} != {V_flat.shape[0]}, using identity")
-                            return dir
-                        return dir @ V_flat
-                    else:
-                        W_O = model.W_O[sae.cfg.hook_layer]
-                        O_flat = einops.rearrange(W_O, "n_heads d_head d_model -> (n_heads d_head) d_model")
-                        if dir.shape[-1] != O_flat.shape[0]:
-                            print(f"Dimension mismatch: {dir.shape[-1]} != {O_flat.shape[0]}, using identity")
-                            return dir
-                        return dir @ O_flat
-                else:
-                    print(f"Unknown hook type '{hook_type}', using identity mapping")
-                    return dir
-            except Exception as e:
-                print(f"Error in to_resid_dir: {e}, using identity mapping")
-                return dir
-        
-        # Apply the patch
-        sae_vis.model_fns.to_resid_dir = flexible_to_resid_dir
-        
-        return original_to_resid_dir
-    
-    @staticmethod
-    def create_visualization(
-        sae_path: str,
-        tokens: t.Tensor,
-        output_file: str,
-        model_name: str,
-        hook_name: str = "blocks.0.mlp.hook_post",
-        hook_layer: int = 0,
-        feature_indices: Optional[Union[int, List[int]]] = None,
-        layout: Optional[SaeVisLayoutConfig] = None,
-        device: str = "cuda",
-        verbose: bool = True,
-        simplified: bool = False,
-        feature_limit: Optional[int] = None,
-    ):
-        """
-        Create a visualization for a trained SAE model.
-        
-        Args:
-            sae_path: Path to the trained SAE
-            tokens: Tokenized data for visualization
-            output_file: Path to save the HTML visualization
-            model_name: Name of the transformer model to load
-            hook_name: Name of the hook point in the model
-            hook_layer: Layer index of the hook point
-            feature_indices: Specific feature indices to visualize
-            layout: Visualization layout configuration
-            device: Device to run computations on
-            verbose: Whether to print progress information
-            simplified: Whether to use a simplified layout initially
-            feature_limit: Maximum number of features to visualize (to avoid OOM)
-        
-        Returns:
-            SaeVisData or None: The visualization data if successful, None otherwise
-        """
-        # Create output directory if needed
-        Path(output_file).parent.mkdir(exist_ok=True, parents=True)
-        
-        # 1. Load SAE
-        if verbose:
-            print(f"Loading SAE from {sae_path}...")
-            
-        from dictionary_learning.utils import load_dictionary
-        sae, config = load_dictionary(sae_path, device)
-        
-        # 2. Adapt the SAE
-        adapted_sae = AutoEncoderAdapter(sae, hook_name=hook_name, hook_layer=hook_layer)
-        
-        # 3. Load the model
-        if verbose:
-            print(f"Loading model {model_name}...")
-            
-        model = HookedTransformer.from_pretrained(model_name, device=device)
-        
-        # 4. Configure which features to visualize
-        if feature_indices is None:
-            # Limit to a reasonable number of features to avoid OOM
-            max_features = feature_limit or min(256, sae.dict_size)
-            feature_indices = list(range(max_features))
-        elif isinstance(feature_indices, int):
-            feature_indices = [feature_indices]
-            
-        # Limit to feature_limit if specified
-        if feature_limit is not None and len(feature_indices) > feature_limit:
-            feature_indices = feature_indices[:feature_limit]
-        
-        # 5. Use default layout if none specified
-        if layout is None:
-            layout = SAEVisAdapter.create_default_layout(simplified=simplified)
-        
-        # 6. Create model adapter
-        adapted_model = ModelAdapter(model, hook_name=hook_name)
-        
-        # 7. Patch necessary functions
-        original_to_resid_dir = SAEVisAdapter.patch_to_resid_dir()
-        
-        try:
-            # 8. Create visualization data
-            if verbose:
-                print(f"Creating visualization data for {len(feature_indices)} features...")
-            
-            sae_vis_data = SaeVisData.create(
-                sae=adapted_sae,
-                model=adapted_model,
-                tokens=tokens,
-                cfg=SaeVisConfig(
-                    features=feature_indices,
-                    feature_centric_layout=layout
-                ),
-                verbose=verbose,
-            )
-            
-            # 9. Save the visualization
-            if verbose:
-                print(f"Saving visualization to {output_file}...")
-                
-            sae_vis_data.save_feature_centric_vis(
-                filename=output_file,
-                feature=feature_indices[0],
-                verbose=verbose
-            )
-            
-            if verbose:
-                print(f"✅ Visualization saved successfully to {output_file}")
-            
-            return sae_vis_data
-            
-        except Exception as e:
-            print(f"❌ Error during visualization creation: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Create a fallback visualization if everything else fails
-            try:
-                if verbose:
-                    print("Attempting to create a basic fallback visualization...")
-                
-                # Create an extremely simplified visualization that just shows activations
-                fallback_visualization(
-                    sae=adapted_sae,
-                    model=model,
-                    tokens=tokens,
-                    output_file=output_file,
-                    feature_indices=feature_indices[:5],  # Just show first 5 features
-                    device=device
-                )
-                
-                if verbose:
-                    print(f"✅ Basic fallback visualization saved to {output_file}")
-            except Exception as fallback_error:
-                print(f"❌ Fallback visualization also failed: {fallback_error}")
-            
-            return None
-        finally:
-            # Restore original functions
-            sae_vis.model_fns.to_resid_dir = original_to_resid_dir
-
-
-def fallback_visualization(
-    sae,
-    model,
-    tokens,
-    output_file,
-    feature_indices=[0],
-    device="cuda"
-):
-    """
-    Create a very basic HTML visualization of feature activations as fallback.
+    Create image visualizations for feature analysis.
     
     Args:
-        sae: The SAE model (adapted)
-        model: The transformer model
-        tokens: Input tokens
-        output_file: Path to save HTML file
-        feature_indices: Feature indices to visualize
-        device: Device to run on
+        feature_stats: Dict mapping feature_idx -> FeatureStats
+        output_dir: Directory to save images
+        analysis_type: "real" or "synthetic" for labeling
+        max_features_per_plot: Maximum features per summary plot
+        
+    Returns:
+        List of generated image paths
     """
-    # Limit to max 10 features for the fallback
-    feature_indices = feature_indices[:10]
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
     
-    # Run the model and get activations
-    with t.inference_mode():
-        # Run on a subset of tokens to avoid OOM
-        sample_tokens = tokens[:min(32, tokens.shape[0])].to(device)
-        _, cache = model.run_with_cache(sample_tokens, names_filter=['blocks.0.hook_resid_post'])
-        
-        # Get residual post activations
-        resid_post = cache['blocks.0.hook_resid_post']
-        
-        # Get SAE activations for features of interest
-        sae_acts = sae.encode(resid_post)
-        
-        # Extract activations for the specified features
-        feature_acts = []
-        for idx in feature_indices:
-            if idx < sae_acts.shape[-1]:
-                acts = sae_acts[..., idx].detach().cpu().numpy().flatten()
-                # Count non-zero activations
-                nonzero = (acts > 0).sum()
-                sparsity = nonzero / acts.size
-                feature_acts.append((idx, acts, sparsity))
+    generated_files = []
     
-    # Create a simple HTML file with histograms
-    with open(output_file, 'w') as f:
-        f.write("""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>SAE Feature Visualization (Fallback)</title>
-            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 20px; }
-                .histogram { width: 800px; height: 300px; margin-bottom: 30px; }
-                h1 { color: #333; }
-                .info { margin-bottom: 20px; color: #666; }
-            </style>
-        </head>
-        <body>
-            <h1>SAE Feature Visualization (Fallback)</h1>
-            <div class="info">
-                <p>This is a simplified fallback visualization showing feature activation histograms.</p>
-            </div>
-        """)
+    # Create individual feature plots
+    for feature_idx, stats in feature_stats.items():
+        print(f"Creating visualization for feature {feature_idx}...")
         
-        # Generate histogram divs
-        for i, (feat_idx, acts, sparsity) in enumerate(feature_acts):
-            f.write(f"""
-            <div class="feature-section">
-                <h2>Feature {feat_idx} (Sparsity: {sparsity:.2%})</h2>
-                <div id="histogram-{i}" class="histogram"></div>
-            </div>
-            """)
+        fig_path = output_path / f"feature_{feature_idx}_{analysis_type}.pdf"
+        _create_single_feature_plot(stats, fig_path, analysis_type)
+        generated_files.append(str(fig_path))
+    
+    # Create summary plots
+    feature_indices = list(feature_stats.keys())
+    for i in range(0, len(feature_indices), max_features_per_plot):
+        batch_indices = feature_indices[i:i+max_features_per_plot]
+        batch_stats = {idx: feature_stats[idx] for idx in batch_indices}
         
-        # Generate JavaScript for the histograms
-        f.write("<script>")
+        summary_path = output_path / f"summary_{i//max_features_per_plot}_{analysis_type}.pdf"
+        _create_summary_plot(batch_stats, summary_path, analysis_type)
+        generated_files.append(str(summary_path))
+    
+    # Create overall statistics plot
+    stats_path = output_path / f"statistics_{analysis_type}.pdf"
+    _create_statistics_plot(feature_stats, stats_path, analysis_type)
+    generated_files.append(str(stats_path))
+    
+    print(f"Generated {len(generated_files)} visualization images in {output_dir}")
+    return generated_files
+
+
+def compare_real_vs_synthetic(real_stats: Dict[int, FeatureStats], 
+                            synthetic_stats: Dict[int, FeatureStats],
+                            output_dir: str = "comparison") -> List[str]:
+    """Create combined real+synthetic visualizations for comparison"""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    generated_files = []
+    
+    # Find common features
+    common_features = set(real_stats.keys()) & set(synthetic_stats.keys())
+    
+    # Create combined feature plots
+    for feature_idx in common_features:
+        print(f"Creating combined visualization for feature {feature_idx}...")
         
-        for i, (feat_idx, acts, sparsity) in enumerate(feature_acts):
-            # Convert to list for JSON serialization
-            acts_list = acts.tolist()
+        fig_path = output_path / f"feature_{feature_idx}_combined.pdf"
+        _create_combined_feature_plot(real_stats[feature_idx], synthetic_stats[feature_idx], fig_path)
+        generated_files.append(str(fig_path))
+    
+    print(f"Generated {len(generated_files)} combined visualization images in {output_dir}")
+    return generated_files
+
+
+def _create_single_feature_plot(stats: FeatureStats, output_path: Path, analysis_type: str):
+    """Create detailed plot for a single feature"""
+    fig = plt.figure(figsize=(16, 10))  # Reduced height since removing logit effects
+    
+    # Choose color based on analysis type
+    color = REAL_COLOR if analysis_type == "real" else SYNTHETIC_COLOR
+    
+    # Main title
+    fig.suptitle(f"Feature {stats.feature_idx} Analysis", 
+                fontsize=16, fontweight='bold')
+    
+    # Create 2 row layout: stats+distribution on top, tokens on bottom
+    gs = fig.add_gridspec(2, 2, height_ratios=[1, 2.5], width_ratios=[2, 1])
+    
+    # Activation distribution (top left)
+    ax_dist = fig.add_subplot(gs[0, 0])
+    _plot_activation_histogram(ax_dist, stats, title="Activation Distribution", color=color)
+    
+    # Feature statistics (top right)
+    ax_stats = fig.add_subplot(gs[0, 1])
+    _plot_feature_stats_list(ax_stats, stats)
+    
+    # Top firing tokens (bottom row, spanning both columns) - now with more space
+    ax_tokens = fig.add_subplot(gs[1, :])
+    _plot_top_tokens(ax_tokens, stats, color=color)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
+def _create_combined_feature_plot(real_stats: FeatureStats, synthetic_stats: FeatureStats, output_path: Path):
+    """Create combined real+synthetic plot for a single feature"""
+    fig = plt.figure(figsize=(16, 12))  # Reduced height since removing logit effects
+    
+    # Main title
+    fig.suptitle(f"Feature {real_stats.feature_idx} - Real vs Synthetic Analysis", 
+                fontsize=18, fontweight='bold')
+    
+    # Create more compact grid layout - removed logit effects
+    gs = fig.add_gridspec(3, 2, height_ratios=[0.8, 0.8, 2.5], width_ratios=[2, 1])
+    
+    # === REAL ANALYSIS SECTION (RED) ===
+    ax_real_dist = fig.add_subplot(gs[0, 0])
+    _plot_activation_histogram(ax_real_dist, real_stats, title="Real Activation Distribution", color=REAL_COLOR)
+    
+    ax_real_stats = fig.add_subplot(gs[0, 1])
+    _plot_feature_stats_list(ax_real_stats, real_stats)
+    
+    # === SYNTHETIC ANALYSIS SECTION (BLUE) ===
+    ax_synth_dist = fig.add_subplot(gs[1, 0])
+    _plot_activation_histogram(ax_synth_dist, synthetic_stats, title="Synthetic Activation Distribution", color=SYNTHETIC_COLOR)
+    
+    ax_synth_explanation = fig.add_subplot(gs[1, 1])
+    _plot_explanation_text(ax_synth_explanation)
+    
+    # Large token info section (spans full width) - more space now
+    ax_tokens = fig.add_subplot(gs[2, :])
+    _plot_large_token_comparison(ax_tokens, real_stats, synthetic_stats)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
+def _plot_explanation_text(ax):
+    """Plot explanation text in compact box"""
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    
+    # Title
+    ax.text(0.5, 0.9, "Context Display", ha='center', va='center', 
+           fontsize=12, fontweight='bold')
+    
+    # Explanation background box
+    rect = patches.Rectangle((0.05, 0.1), 0.9, 0.7, 
+                           linewidth=2, edgecolor='black', 
+                           facecolor='lightyellow', alpha=0.7)
+    ax.add_patch(rect)
+    
+    # Explanation text
+    explanation = """Shows 12 tokens before peak +
+peak token (bold red) + 
+12 tokens after
+
+Each line: Ex# (activation): context"""
+    
+    ax.text(0.5, 0.45, explanation, ha='center', va='center', 
+           fontsize=9, style='italic', linespacing=1.3)
+
+
+def _plot_top_tokens(ax, stats: FeatureStats, color: str = 'lightblue'):
+    """Plot contextual tokens around peak activations (12 before + peak + 12 after)"""
+    ax.set_title("Context Around Peak Activations", fontsize=14, fontweight='bold')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    
+    if not stats.examples:
+        ax.text(0.5, 0.5, "No token data available", ha='center', va='center',
+               transform=ax.transAxes, fontsize=10)
+        return
+    
+    # Background box
+    rect = patches.Rectangle((0.05, 0.05), 0.9, 0.9, 
+                           linewidth=2, edgecolor='black', 
+                           facecolor=color, alpha=0.1)
+    ax.add_patch(rect)
+    
+    # Show contextual examples around peak activations - more space now
+    _draw_contextual_tokens(ax, stats.examples[:12], 0.08, 0.9, 0.84)  # Show top 12 examples
+
+
+def _draw_contextual_tokens(ax, examples: List[ActivationExample], start_x: float, start_y: float, width: float):
+    """Draw contextual tokens around peak positions - SINGLE LINE with larger font"""
+    if not examples:
+        ax.text(start_x + width/2, start_y - 0.1, "No examples found", 
+               ha='center', va='center', fontsize=10)
+        return
+    
+    line_height = 0.08  # Much tighter since everything is on one line now
+    
+    for ex_idx, example in enumerate(examples):
+        y_pos = start_y - (ex_idx * line_height)  # Single y position for entire line
+        
+        # Get peak position
+        peak_pos = example.peak_position
+        tokens = example.tokens
+        activations = example.activations
+        
+        # Calculate context window (12 before + peak + 12 after = 25 total)
+        context_start = max(0, peak_pos - 12)
+        context_end = min(len(tokens), peak_pos + 13)  # +13 to include peak + 12 after
+        
+        # Get context tokens and activations
+        context_tokens = tokens[context_start:context_end]
+        context_activations = activations[context_start:context_end]
+        
+        # Adjust peak position within context
+        peak_in_context = peak_pos - context_start
+        
+        # Build text parts
+        before_parts = []
+        peak_part = ""
+        after_parts = []
+        
+        for i, (token, activation) in enumerate(zip(context_tokens, context_activations)):
+            token_clean = token.strip().replace('\n', '\\n').replace('\t', '\\t')
             
-            f.write(f"""
-            // Data for histogram {i}
-            const data{i} = {{
-                x: {acts_list},
-                type: 'histogram',
-                marker: {{
-                    color: 'rgba(255, 100, 0, 0.7)',
-                }}
-            }};
-            
-            // Layout
-            const layout{i} = {{
-                title: 'Feature {feat_idx} Activations',
-                xaxis: {{ title: 'Activation Value' }},
-                yaxis: {{ title: 'Frequency' }}
-            }};
-            
-            // Create the plot
-            Plotly.newPlot('histogram-{i}', [data{i}], layout{i});
-            """)
+            if i < peak_in_context:
+                before_parts.append(token_clean)
+            elif i == peak_in_context:
+                peak_part = token_clean
+            else:
+                after_parts.append(token_clean)
         
-        f.write("</script></body></html>")
+        # Create the text segments
+        before_text = " ".join(before_parts)
+        after_text = " ".join(after_parts)
+        
+        # Start position for this line
+        x_offset = start_x + 0.01
+        
+        # SINGLE LINE: Example header + tokens all together
+        # Example header (same size as tokens now)
+        header_text = f"Ex{ex_idx + 1} ({example.max_activation:.3f}): "
+        ax.text(x_offset, y_pos, header_text, 
+               ha='left', va='center', fontsize=9, fontweight='bold')  # Same as token size
+        x_offset += len(header_text) * 0.0045  # Tight spacing
+        
+        # Display before text
+        if before_text:
+            ax.text(x_offset, y_pos, before_text + " ", 
+                   ha='left', va='center', fontsize=9,  # INCREASED from 7 to 9
+                   family='monospace', color='black')
+            x_offset += len(before_text + " ") * 0.0049  # Tight spacing
+        
+        # Display peak token in bold red
+        if peak_part:
+            ax.text(x_offset, y_pos, peak_part, 
+                   ha='left', va='center', fontsize=9,  # INCREASED from 7 to 9
+                   family='monospace', color='red', fontweight='bold')
+            x_offset += len(peak_part) * 0.0045
+        
+        # Display after text
+        if after_text:
+            ax.text(x_offset, y_pos, " " + after_text,
+                   ha='left', va='center', fontsize=9,  # INCREASED from 7 to 9
+                   family='monospace', color='black')
+
+
+def _plot_large_token_comparison(ax, real_stats: FeatureStats, synthetic_stats: FeatureStats):
+    """Plot contextual comparisons instead of top token lists"""
+    ax.set_title("Context Around Peak Activations: Real vs Synthetic", fontsize=16, fontweight='bold')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    
+    # === LEFT SIDE: REAL DATA (RED) ===
+    real_x = 0.02
+    real_width = 0.46
+    
+    # Real data background box
+    real_rect = patches.Rectangle((real_x, 0.05), real_width, 0.9, 
+                                linewidth=2, edgecolor='black', 
+                                facecolor=REAL_COLOR, alpha=0.1)
+    ax.add_patch(real_rect)
+    
+    # Real data title
+    ax.text(real_x + real_width/2, 0.93, "Real Data Context", 
+           ha='center', va='center', fontsize=14, fontweight='bold',
+           bbox=dict(boxstyle='round', facecolor=REAL_COLOR, alpha=0.8))
+    
+    # Show contextual examples for real data - more examples now
+    if real_stats.examples:
+        _draw_contextual_tokens(ax, real_stats.examples[:10], real_x + 0.02, 0.88, real_width - 0.04)
+    
+    # === RIGHT SIDE: SYNTHETIC DATA (BLUE) ===
+    synth_x = 0.52
+    synth_width = 0.46
+    
+    # Synthetic data background box
+    synth_rect = patches.Rectangle((synth_x, 0.05), synth_width, 0.9, 
+                                 linewidth=2, edgecolor='black', 
+                                 facecolor=SYNTHETIC_COLOR, alpha=0.1)
+    ax.add_patch(synth_rect)
+    
+    # Synthetic data title
+    ax.text(synth_x + synth_width/2, 0.93, "Synthetic Context", 
+           ha='center', va='center', fontsize=14, fontweight='bold',
+           bbox=dict(boxstyle='round', facecolor=SYNTHETIC_COLOR, alpha=0.8))
+    
+    # Show contextual examples for synthetic data - more examples now
+    if synthetic_stats.examples:
+        _draw_contextual_tokens(ax, synthetic_stats.examples[:10], synth_x + 0.02, 0.88, synth_width - 0.04)
+
+
+def _plot_feature_stats_list(ax, stats: FeatureStats):
+    """Plot feature statistics as a clean list with red box"""
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    
+    # Title above the box
+    ax.text(0.5, 0.95, "Feature Statistics", ha='center', va='center', 
+           fontsize=12, fontweight='bold')
+    
+    # Red background box
+    rect = patches.Rectangle((0.05, 0.05), 0.9, 0.85, 
+                           linewidth=2, edgecolor='black', 
+                           facecolor=REAL_COLOR, alpha=0.3)
+    ax.add_patch(rect)
+    
+    # Statistics list
+    stats_list = [
+        f"Sparsity: {stats.sparsity:.3f}",
+        f"Mean Activation: {stats.mean_activation:.3f}",
+        f"Max Activation: {stats.max_activation:.3f}",
+        f"Decoder Norm: {stats.decoder_norm:.3f}",
+        f"Examples Found: {len(stats.examples)}"
+    ]
+    
+    # Draw each line
+    for i, stat_line in enumerate(stats_list):
+        y_pos = 0.75 - (i * 0.12)
+        ax.text(0.1, y_pos, stat_line, ha='left', va='center', 
+               fontsize=10, fontweight='normal')
+
+
+def _plot_activation_histogram(ax, stats: FeatureStats, title: str = "Activation Distribution", color: str = 'skyblue'):
+    """Plot distribution of activations"""
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    
+    if not stats.examples:
+        ax.text(0.5, 0.5, "No activation data", ha='center', va='center',
+               transform=ax.transAxes, fontsize=10)
+        return
+    
+    # Collect all positive activations
+    all_activations = []
+    for example in stats.examples:
+        all_activations.extend([act for act in example.activations if act > 0])
+    
+    if not all_activations:
+        ax.text(0.5, 0.5, "No positive activations", ha='center', va='center',
+               transform=ax.transAxes, fontsize=10)
+        return
+    
+    # Create histogram
+    ax.hist(all_activations, bins=20, alpha=0.7, color=color, edgecolor='black')
+    ax.set_xlabel("Activation Value", fontsize=10)
+    ax.set_ylabel("Count", fontsize=10)
+    ax.set_xlim(0, None)
+    
+    # Set y-axis (counts) to show only whole numbers
+    import matplotlib.ticker as ticker
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    
+    # Add more ticks on x-axis (activation values) for better granularity
+    max_activation = max(all_activations)
+    if max_activation <= 1:
+        # For small ranges, use 0.1 intervals
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(0.1))
+        ax.xaxis.set_minor_locator(ticker.MultipleLocator(0.05))
+    elif max_activation <= 5:
+        # For medium ranges, use 0.5 intervals
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(0.5))
+        ax.xaxis.set_minor_locator(ticker.MultipleLocator(0.25))
+    elif max_activation <= 10:
+        # For larger ranges, use 1.0 intervals
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(1.0))
+        ax.xaxis.set_minor_locator(ticker.MultipleLocator(0.5))
+    else:
+        # For very large ranges, use adaptive spacing
+        ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=10))
+        ax.xaxis.set_minor_locator(ticker.MaxNLocator(nbins=20))
+    
+    ax.grid(True, alpha=0.3)
+    
+    # Add statistics text
+    mean_val = np.mean(all_activations)
+    max_val = np.max(all_activations)
+    std_val = np.std(all_activations)
+    
+    stats_text = f"Mean: {mean_val:.3f} | Max: {max_val:.3f} | Std: {std_val:.3f} | Count: {len(all_activations)}"
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+
+
+def _plot_logit_effects(ax, stats: FeatureStats):
+    """Plot top boosted and suppressed tokens in blue theme"""
+    ax.set_title("Logit Effects", fontsize=12, fontweight='bold')
+    
+    # Combine boosted and suppressed tokens
+    all_tokens = []
+    all_effects = []
+    colors = []
+    
+    # Add boosted tokens (positive effects) - now blue
+    for token, effect in stats.top_boosted_tokens[:5]:
+        # Show full token without truncation
+        token_display = token.strip().replace('\n', '\\n').replace('\t', '\\t')
+        all_tokens.append(f"+{token_display}")
+        all_effects.append(effect)
+        colors.append('steelblue')  # Blue for positive
+    
+    # Add suppressed tokens (negative effects) - also blue but darker
+    for token, effect in stats.top_suppressed_tokens[:5]:
+        # Show full token without truncation
+        token_display = token.strip().replace('\n', '\\n').replace('\t', '\\t')
+        all_tokens.append(f"-{token_display}")
+        all_effects.append(effect)
+        colors.append('darkblue')  # Darker blue for negative
+    
+    if not all_tokens:
+        ax.text(0.5, 0.5, "No logit effects computed", ha='center', va='center',
+               transform=ax.transAxes, fontsize=10)
+        ax.axis('off')
+        return
+    
+    # Create horizontal bar plot
+    y_pos = np.arange(len(all_tokens))
+    bars = ax.barh(y_pos, all_effects, color=colors, alpha=0.7)
+    
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(all_tokens, fontsize=7)  # Smaller font to fit longer tokens
+    ax.set_xlabel("Logit Effect", fontsize=10)
+    ax.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+    
+    # Add value labels on bars
+    for bar, effect in zip(bars, all_effects):
+        width = bar.get_width()
+        ax.text(width + (0.01 * max(abs(e) for e in all_effects) if all_effects else 0.01), 
+               bar.get_y() + bar.get_height()/2, f'{effect:.3f}',
+               ha='left' if width >= 0 else 'right', va='center', fontsize=7)
+
+
+def _create_summary_plot(feature_stats: Dict[int, FeatureStats], output_path: Path, analysis_type: str):
+    """Create summary plot for multiple features"""
+    n_features = len(feature_stats)
+    color = REAL_COLOR if analysis_type == "real" else SYNTHETIC_COLOR
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle(f"Feature Summary - {analysis_type.title()} Analysis", fontsize=16, fontweight='bold')
+    
+    feature_indices = list(feature_stats.keys())
+    
+    # Sparsity comparison
+    ax = axes[0, 0]
+    sparsities = [feature_stats[idx].sparsity for idx in feature_indices]
+    ax.bar(range(len(feature_indices)), sparsities, color=color, alpha=0.7)
+    ax.set_title("Sparsity by Feature")
+    ax.set_xlabel("Feature Index")
+    ax.set_ylabel("Sparsity")
+    ax.set_xticks(range(len(feature_indices)))
+    ax.set_xticklabels(feature_indices, rotation=45)
+    
+    # Max activation comparison
+    ax = axes[0, 1]
+    max_acts = [feature_stats[idx].max_activation for idx in feature_indices]
+    ax.bar(range(len(feature_indices)), max_acts, color=color, alpha=0.7)
+    ax.set_title("Max Activation by Feature")
+    ax.set_xlabel("Feature Index")
+    ax.set_ylabel("Max Activation")
+    ax.set_xticks(range(len(feature_indices)))
+    ax.set_xticklabels(feature_indices, rotation=45)
+    
+    # Decoder norm comparison
+    ax = axes[0, 2]
+    dec_norms = [feature_stats[idx].decoder_norm for idx in feature_indices]
+    ax.bar(range(len(feature_indices)), dec_norms, color=color, alpha=0.7)
+    ax.set_title("Decoder Norm by Feature")
+    ax.set_xlabel("Feature Index")
+    ax.set_ylabel("Decoder Norm")
+    ax.set_xticks(range(len(feature_indices)))
+    ax.set_xticklabels(feature_indices, rotation=45)
+    
+    # Example count comparison
+    ax = axes[1, 0]
+    example_counts = [len(feature_stats[idx].examples) for idx in feature_indices]
+    ax.bar(range(len(feature_indices)), example_counts, color=color, alpha=0.7)
+    ax.set_title("Number of Examples Found")
+    ax.set_xlabel("Feature Index")
+    ax.set_ylabel("Example Count")
+    ax.set_xticks(range(len(feature_indices)))
+    ax.set_xticklabels(feature_indices, rotation=45)
+    
+    # Sparsity vs Max Activation scatter
+    ax = axes[1, 1]
+    ax.scatter(sparsities, max_acts, alpha=0.7, s=60, color=color)
+    ax.set_xlabel("Sparsity")
+    ax.set_ylabel("Max Activation")
+    ax.set_title("Sparsity vs Max Activation")
+    for i, idx in enumerate(feature_indices):
+        ax.annotate(str(idx), (sparsities[i], max_acts[i]), xytext=(5, 5), 
+                   textcoords='offset points', fontsize=8)
+    
+    # Remove unused subplot
+    axes[1, 2].remove()
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
+def _create_statistics_plot(feature_stats: Dict[int, FeatureStats], output_path: Path, analysis_type: str):
+    """Create overall statistics visualization"""
+    color = REAL_COLOR if analysis_type == "real" else SYNTHETIC_COLOR
+    
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(f"Overall Statistics - {analysis_type.title()} Analysis", fontsize=16, fontweight='bold')
+    
+    # Extract all statistics
+    sparsities = [stats.sparsity for stats in feature_stats.values()]
+    max_activations = [stats.max_activation for stats in feature_stats.values()]
+    mean_activations = [stats.mean_activation for stats in feature_stats.values()]
+    decoder_norms = [stats.decoder_norm for stats in feature_stats.values()]
+    
+    # Sparsity distribution
+    axes[0, 0].hist(sparsities, bins=20, alpha=0.7, color=color, edgecolor='black')
+    axes[0, 0].set_title("Sparsity Distribution")
+    axes[0, 0].set_xlabel("Sparsity")
+    axes[0, 0].set_ylabel("Frequency")
+    
+    # Max activation distribution
+    axes[0, 1].hist(max_activations, bins=20, alpha=0.7, color=color, edgecolor='black')
+    axes[0, 1].set_title("Max Activation Distribution")
+    axes[0, 1].set_xlabel("Max Activation")
+    axes[0, 1].set_ylabel("Frequency")
+    
+    # Mean activation distribution
+    axes[1, 0].hist(mean_activations, bins=20, alpha=0.7, color=color, edgecolor='black')
+    axes[1, 0].set_title("Mean Activation Distribution")
+    axes[1, 0].set_xlabel("Mean Activation")
+    axes[1, 0].set_ylabel("Frequency")
+    
+    # Decoder norm distribution
+    axes[1, 1].hist(decoder_norms, bins=20, alpha=0.7, color=color, edgecolor='black')
+    axes[1, 1].set_title("Decoder Norm Distribution")
+    axes[1, 1].set_xlabel("Decoder Norm")
+    axes[1, 1].set_ylabel("Frequency")
+    
+    # Add statistics text
+    stats_text = f"""
+    Features analyzed: {len(feature_stats)}
+    Avg sparsity: {np.mean(sparsities):.3f}
+    Avg max activation: {np.mean(max_activations):.3f}
+    Avg decoder norm: {np.mean(decoder_norms):.3f}
+    Analysis type: {analysis_type.title()}
+    """
+    
+    fig.text(0.02, 0.02, stats_text, fontsize=10, verticalalignment='bottom',
+             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.7))
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
+# Legacy function name for compatibility
+def visualize_features_combined(real_stats: Dict[int, FeatureStats], 
+                              synthetic_stats: Dict[int, FeatureStats],
+                              output_dir: str = "visualizations") -> List[str]:
+    """Legacy wrapper for compare_real_vs_synthetic"""
+    return compare_real_vs_synthetic(real_stats, synthetic_stats, output_dir)

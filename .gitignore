@@ -51,6 +51,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+tests/
 
 # Translations
 *.mo
@@ -128,6 +129,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+venv.spar/
+spar/
 
 # Spyder project settings
 .spyderproject
@@ -168,4 +171,22 @@ nohup.out
 
 # trained model folders
 trained*/
- 
+analysis_scripts/
+comprehensive_histogram_analysis/
+experiments/
+feature_degeneracy_analysis/
+gaussianity_analysis/
+latent_analysis/
+logs/
+online_gaussianity_analysis/
+sae_vis/__pycache__/
+SAEBench-main/sae_bench/custom_saes/eval_results/
+SAEBench-main/sae_bench/custom_saes/saebench_plots/
+similarity_analysis/
+wandb/
+# workshop paper build artifacts
+workshop/*.aux
+workshop/*.log
+workshop/*.out
+workshop/*.bbl
+workshop/*.blg
